@@ -9,7 +9,7 @@
 
 #define BIGINT_WORDS 8
 
-// CUDA 错误检查宏
+
 #define CHECK_CUDA(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -19,9 +19,6 @@
 } while(0)
 
 
-// ============================================================================
-// 1. 数据结构 (与 C 版本相同, 可在 Host 和 Device 间传递)
-// ============================================================================
 struct BigInt {
     uint32_t data[BIGINT_WORDS];
 };
@@ -36,15 +33,12 @@ struct ECPointJac {
     bool infinity;
 };
 
-// ============================================================================
-// 常量参数 (在 GPU 的 __constant__ 内存中)
-// ============================================================================
+
 __constant__ BigInt const_p;
 __constant__ ECPointJac const_G_jacobian;
 __constant__ BigInt const_n;
 
 
-// --- BigInt 基本运算 ---
 __host__ __device__ __forceinline__ void init_bigint(BigInt *x, uint32_t val) {
     x->data[0] = val;
     for (int i = 1; i < BIGINT_WORDS; i++) x->data[i] = 0;
@@ -233,7 +227,6 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     copy_bigint(res, &R_temp);
 }
 
-// 其他模运算函数
 __device__ __forceinline__ void sub_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
     BigInt temp;
     if (compare_bigint(a, b) < 0) {
@@ -246,7 +239,6 @@ __device__ __forceinline__ void sub_mod_device(BigInt *res, const BigInt *a, con
     copy_bigint(res, &temp);
 }
 
-// 将 a mod n，结果放到 res（因为 a < 2^256, 所以最多减一次 n 即可）
 __device__ __forceinline__ void scalar_mod_n(BigInt *res, const BigInt *a) {
     if (compare_bigint(a, &const_n) >= 0) {
         // a >= n, 做一次减法
@@ -325,8 +317,6 @@ __device__ void mod_inverse(BigInt *res, const BigInt *a) {
 }
 
 
-
-// --- 雅可比坐标点运算 (Device 版本) ---
 __device__ __forceinline__ void point_set_infinity_jac(ECPointJac *P) {
     P->infinity = true;
 }
@@ -423,7 +413,6 @@ __device__ void add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJ
 
 __device__ void jacobian_to_affine(ECPoint *R, const ECPointJac *P) {
     if (P->infinity) {
-        // 标记为无穷远点，并把坐标全部置零
         R->infinity = true;
         init_bigint(&R->x, 0);
         init_bigint(&R->y, 0);
@@ -509,6 +498,6 @@ __device__ void scalar_multiply_jac_device(ECPointJac *result, const ECPointJac 
     
     point_copy_jac(result, &res);
 }
-#endif // SECP256K1_CUH
+#endif
 
 //Author telegram: https://t.me/nmn5436
