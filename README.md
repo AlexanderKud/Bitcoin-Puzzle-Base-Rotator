@@ -1,6 +1,6 @@
 ### This is a Modification of https://github.com/puzzleman22/bitcoin_puzzle_transformation
 
-each thread has a base from 2 to 32 base
+each thread has a base from 2 to 2500 base
 
 1) base random number generation
 2) convert to base (depends on thread number)
