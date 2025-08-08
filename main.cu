@@ -10,18 +10,14 @@
 #pragma once
 #include <stdint.h>
 #include <curand_kernel.h>
-#include "secp256k1.cuh"
-#include <iostream>
-#include <vector>
-#include <string>
-#include <iomanip>
-#include <stdexcept>
-#include <sstream>
-#include <cstdint>
-#include <fstream>
-#pragma once
-#include <stdint.h>
-#include <curand_kernel.h>
+
+#define CHECK_CUDA(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
 
 // Optimized rotate right for SHA-256
 __device__ inline uint32_t rotr(uint32_t x, uint32_t n) {
@@ -572,68 +568,52 @@ __device__ void generate_method_avalanche(uint64_t* rng_state, const BigInt* min
 }
 
 
-
 __device__ void generate_random_bigint_range_fast(uint64_t* rng_state, const BigInt* min, const BigInt* max, BigInt* result) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
-    
-    // Calculate range = max - min + 1 (common for all methods)
+    // Calculate range = max - min + 1
     BigInt range, range_plus_one;
     bigint_subtract(max, min, &range);
     
     BigInt one = {1, 0, 0, 0, 0, 0, 0, 0};
     bigint_add(&range, &one, &range_plus_one);
-    
-    // Find highest bit (common for all methods)
+
+    // Find highest bit
     int highest_word = 7;
     while (highest_word > 0 && range_plus_one.data[highest_word] == 0)
         highest_word--;
+
     int highest_bit = 31;
     while (highest_bit > 0 && (range_plus_one.data[highest_word] & (1U << highest_bit)) == 0)
         highest_bit--;
     highest_bit += 1;
-    
-    // Ultra-chaotic method selection
-    uint32_t chaos_seed = tid ^ (warp_id << 5) ^ (lane_id << 10);
-    chaos_seed *= 0x9E3779B9;  // Golden ratio multiplier
-    chaos_seed ^= (chaos_seed >> 16);
-    chaos_seed *= 0x85EBCA6B;
-    chaos_seed ^= (chaos_seed >> 13);
-    chaos_seed *= 0xC2B2AE35;
-    chaos_seed ^= (chaos_seed >> 16);
-    
-    // Multi-factor method selection
-    int method = chaos_seed % 3;
-    
-    // Lane position influence
-    if (lane_id & 1) {  // Odd lanes
-        method = (method + 1) % 3;
-    }
-    if (lane_id & 2) {  // Every 2nd bit set
-        method = (method + 2) % 3;
-    }
-    
-    // Warp-based rotation
-    method = (method + (warp_id & 0x3)) % 3;
-    
-    // Grid position influence
-    uint32_t grid_factor = (blockIdx.x * gridDim.y + blockIdx.y) % 7;
-    if (grid_factor < 3) {
-        method = (method + grid_factor) % 3;
-    }
-    
-    // Branch based on computed method
-    switch (method) {
-        case 0:
-            generate_method_chaotic(rng_state, min, &range_plus_one, highest_word, highest_bit, result);
-            break;
-        case 1:
-            generate_method_entropy(rng_state, min, &range_plus_one, highest_word, highest_bit, result, tid);
-            break;
-        case 2:
-            generate_method_avalanche(rng_state, min, &range_plus_one, highest_word, highest_bit, result);
-            break;
+
+    // Generate random using xorshift
+    while (true) {
+        BigInt candidate = {0};
+
+        // Fill with random data - optimized loop
+        #pragma unroll 4
+        for (int i = 0; i <= highest_word && i < 4; i++) {
+            uint64_t r = xorshift64(rng_state);
+            if (i * 2 < 8) candidate.data[i * 2] = (uint32_t)r;
+            if (i * 2 + 1 < 8) candidate.data[i * 2 + 1] = (uint32_t)(r >> 32);
+        }
+
+        // Mask highest word
+        if (highest_word < 8) {
+            uint32_t mask = (highest_bit == 32) ? 0xFFFFFFFF : ((1U << highest_bit) - 1);
+            candidate.data[highest_word] &= mask;
+            
+            #pragma unroll
+            for (int i = highest_word + 1; i < 8; i++) {
+                candidate.data[i] = 0;
+            }
+        }
+
+        // Check if in range
+        if (bigint_compare(&candidate, &range_plus_one) < 0) {
+            bigint_add(&candidate, min, result);
+            return;
+        }
     }
 }
 
@@ -1113,7 +1093,36 @@ __device__ __forceinline__ void binary_vertical_rotate_up(char* binary_str) {
     }
 }
 
-
+__device__ void shuffleBinaryAfterFirst1(char* binary_str, unsigned int seed) {
+    // Find first '1'
+    char* first1 = binary_str;
+    while (*first1 && *first1 != '1') first1++;
+    
+    if (*first1 == '\0' || *(first1 + 1) == '\0') return;
+    
+    // Find length of substring after first '1'
+    char* start = first1 + 1;
+    int length = 0;
+    char* ptr = start;
+    while (*ptr) {
+        length++;
+        ptr++;
+    }
+    
+    if (length <= 1) return;
+    
+    // Fisher-Yates shuffle algorithm
+    for (int i = length - 1; i > 0; i--) {
+        // Simple pseudo-random number generation
+        seed = seed * 1103515245 + 12345;
+        int j = (seed / 65536) % (i + 1);
+        
+        // Swap characters at positions i and j
+        char temp = start[i];
+        start[i] = start[j];
+        start[j] = temp;
+    }
+}
 // Reverse binary string after first '1'
 __device__ void reverseBinaryAfterFirst1(char* binary_str) {
     // Find first '1'
@@ -1324,20 +1333,40 @@ __device__ void simple_base_transform(BigInt* num, int base, int rotation) {
         bigint_add(num, num, &temp_add);
     }
 }
+// Define the range of bases to use
+#define MIN_BASE 2
+#define MAX_BASE 2513  // Expanded from 32 to 256 bases
+#define NUM_BASES (MAX_BASE - MIN_BASE + 1)
 
-// Optimization 1: Pre-allocate and reuse more variables
+// Device function for min
+__device__ __forceinline__ int d_min(int a, int b) {
+    return (a < b) ? a : b;
+}
+
+// Device function for max
+__device__ __forceinline__ int d_max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+// Optimization: Assign bases per warp (32 threads)
 __global__ void start_optimized(const char* minRangePure, const char* maxRangePure, const char* target) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         printf("min: %s\n", minRangePure);
         printf("max: %s\n", maxRangePure);
-        printf("ripemd160 target: %s\n\n", target);
+        printf("ripemd160 target: %s\n", target);
+        printf("Using bases from %d to %d (%d total bases)\n\n", MIN_BASE, MAX_BASE, NUM_BASES);
     }
     
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int original_length = d_strlen(minRangePure) * 4;
     
-    // Each thread gets its own base (2-32)
-    int thread_base = 2 + (tid % 31); // Bases 2-32
+    // Calculate warp ID and thread's position within the warp
+    int warp_id = tid / 32;  // Which warp this thread belongs to
+    int lane_id = threadIdx.x % 32;  // Thread's position within its warp (0-31)
+    
+    // Each warp gets a different base
+    // With more bases, we can have unique bases for more warps
+    int warp_base = MIN_BASE + (warp_id % NUM_BASES);
     
     // Move these outside the loop - they don't change
     char minRange[65];
@@ -1354,14 +1383,18 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
     unsigned long long local_keys_checked = 0;
     
     // Improved seeding with better entropy mixing
+    // Use both warp_id and lane_id for better entropy distribution
     uint64_t seed = clock64();
-    seed ^= ((uint64_t)tid << 32) | ((uint64_t)blockIdx.x << 16) | threadIdx.x;
+    seed ^= ((uint64_t)warp_id << 40) | ((uint64_t)lane_id << 32) | 
+            ((uint64_t)blockIdx.x << 16) | threadIdx.x;
     seed = mix(seed);
     seed ^= ((uint64_t)gridDim.x << 48) | ((uint64_t)blockDim.x << 32);
+    // Add base to seed for more variation
+    seed ^= ((uint64_t)warp_base << 24);
     uint64_t rng_state = mix(seed);
     
     // Pre-allocate ALL working variables once - avoid repeated allocation overhead
-    BigInt random_value, priv2, priv, base_variant;
+    BigInt random_value, priv2, base_variant;
     ECPointJac result_jac;
     ECPoint public_key;
     uint8_t pubkey[33];
@@ -1375,26 +1408,29 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
     uint8_t target_bytes[20];
     hex_string_to_bytes(target, target_bytes, 20);
     
+    // Debug output for first thread of selected warps
+    if (lane_id == 0 && (warp_id < 5 || warp_id % 50 == 0)) {
+        printf("Warp %d using base %d\n", warp_id, warp_base);
+    }
+    int length = (str_len(minRangePure) - 1) * 4;
     int c = 0;
     while(local_found == 0 && g_found == 0) {
-        // 1) Generate the base number as before
+        // 1) Generate the base number
+        // Each thread in the warp generates its own random value
         generate_random_bigint_range_fast(&rng_state, &min, &max, &random_value);
         
-        // Debug output for first thread
-        if (tid == 1 && c < 3) {
-            bigint_to_hex(&random_value, temp_hex);
-            printf("Thread %d (base %d): Original hex: %s\n", tid, thread_base, temp_hex);
-        }
         
-        // 3) Create variations based on the thread's base (up to 32 variations)
-        int max_rotations = thread_base; // Each base gets its own number of rotations
-        for (int rotation = 0; rotation < max_rotations && local_found == 0 && g_found == 0; rotation++) {
-            // 4) Create base-specific variation while preserving "1" prefix
-            create_base_variation_preserve_prefix(&random_value, &base_variant, thread_base, rotation);
+        // 3) Create variations based on the warp's base
+        // Limit max rotations to prevent excessive iterations for large bases
+        int max_rotations = (warp_base < 64) ? warp_base : 64; // Cap at 64 rotations for performance
+        
+        // Distribute rotations across threads in the warp
+        // Each thread handles different rotations to maximize parallelism
+        for (int base_rotation = lane_id; base_rotation < max_rotations && local_found == 0 && g_found == 0; 
+             base_rotation += 32) {
             
-            // Alternative: Use simple transform instead
-            // copy_bigint(&base_variant, &random_value);
-            // simple_base_transform(&base_variant, thread_base, rotation);
+            // 4) Create base-specific variation while preserving "1" prefix
+            create_base_variation_preserve_prefix(&random_value, &base_variant, warp_base, base_rotation);
             
             // Convert to binary for existing transformations
             bigint_to_binary(&base_variant, binary);
@@ -1402,69 +1438,76 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
             // Apply existing nested loop transformations
             for(int inv = 0; inv < 2 && local_found == 0 && g_found == 0; inv++) {
                 for(int z = 0; z < 2 && local_found == 0 && g_found == 0; z++) {
-                    //for(int y = 0; y < original_length - 4 && local_found == 0 && g_found == 0; y++) {
-                        for(int x = 0; x < 16 && local_found == 0 && g_found == 0; x++) {
-                            
-                            // Convert binary to BigInt directly - skip hex conversion
-                            binary_to_bigint_direct(binary, &priv2);
-                            
-                            // Inline scalar_mod_n to avoid function call overhead
-                            if (compare_bigint(&priv2, &const_n) >= 0) {
-                                ptx_u256Sub(&priv, &priv2, &const_n);
-                            } else {
-                                copy_bigint(&priv, &priv2);
-                            }
-                            
-                            // Keep the windowed method - it's better for your use case
-                            scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv);
-                            jacobian_to_affine(&public_key, &result_jac);
-                            coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
-                            hash160(pubkey, 33, hash160_out);
-                            
-                            local_keys_checked++;
-                            
-                            // Debug output for specific conditions
-                            if(tid == 20 && inv == 0 && z == 0 && x == 0) {
-                                hash160_to_hex(hash160_out, hash160_str);
-                                char hex_str[65];
-                                bigint_to_hex(&priv, hex_str);
-                                printf("T%d R%d: %s -> %s -> %s\n", 
-                                       tid, rotation, binary, hex_str, hash160_str);
-                            }
-                            
-                            // Optimization 3: Early exit with minimal branching
-                            if (compare_hash160_fast(hash160_out, target_bytes)) {
-                                if (atomicCAS((int*)&g_found, 0, 1) == 0) {
-                                    // Only convert to hex when found
-                                    binary_to_hex(binary, temp_hex);
-                                    hash160_to_hex(hash160_out, hash160_str);
-                                    
-                                    memcpy(g_found_hex, temp_hex, 65);
-                                    memcpy(g_found_hash160, hash160_str, 41);
-                                    
-                                    printf("\n*** FOUND! ***\n");
-                                    printf("Thread: %d, Base: %d, Rotation: %d\n", tid, thread_base, rotation);
-                                    printf("Private Key: %s\n", temp_hex);
-                                    printf("Hash160: %s\n", hash160_str);
-                                }
-                                local_found = 1;
-                                goto exit_all_loops; // Break all nested loops efficiently
-                            }
-                            
-                            binary_vertical_rotate_up(binary);
-                        }
-                    //    binary_rotate_left_by_one(binary);
-                   // }
+					for(int y = 0; y < length; y++)
+					{
+						for(int x = 0; x < 16 && local_found == 0 && g_found == 0; x++) {
+							
+							shuffleBinaryAfterFirst1(binary, rng_state);
+							// Convert binary to BigInt directly - skip hex conversion
+							binary_to_bigint_direct(binary, &priv2);
+							
+							// Keep the windowed method - it's better for your use case
+							scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv2);
+							jacobian_to_affine(&public_key, &result_jac);
+							coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
+							hash160(pubkey, 33, hash160_out);
+							
+							local_keys_checked++;
+							
+							// Debug output for specific conditions (first thread of first warp)
+							if(warp_id == 0 && lane_id == 0 && x == 0) {
+								hash160_to_hex(hash160_out, hash160_str);
+								char hex_str[65];
+								bigint_to_hex(&priv2, hex_str);
+								printf("W%d L%d R%d: %s -> %s -> %s\n", 
+									   warp_id, lane_id, base_rotation, binary, hex_str, hash160_str);
+							}
+							
+							// Optimization 3: Early exit with minimal branching
+							if (compare_hash160_fast(hash160_out, target_bytes)) {
+								if (atomicCAS((int*)&g_found, 0, 1) == 0) {
+									// Only convert to hex when found
+									binary_to_hex(binary, temp_hex);
+									hash160_to_hex(hash160_out, hash160_str);
+									
+									memcpy(g_found_hex, temp_hex, 65);
+									memcpy(g_found_hash160, hash160_str, 41);
+									
+									printf("\n*** FOUND! ***\n");
+									printf("Warp: %d, Lane: %d, Base: %d, Rotation: %d\n", 
+										   warp_id, lane_id, warp_base, base_rotation);
+									printf("Private Key: %s\n", temp_hex);
+									printf("Hash160: %s\n", hash160_str);
+								}
+								local_found = 1;
+								goto exit_all_loops; // Break all nested loops efficiently
+							}
+							
+							binary_vertical_rotate_up(binary);
+						}
+						binary_rotate_left_by_one(binary);
+					}
                     reverseBinaryAfterFirst1(binary);
                 }
                 invertBinaryAfterFirst1(binary);
             }
         }
         
+        // Optional: Warp-level synchronization for cooperative work
+        // __syncwarp(); // Uncomment if threads within a warp need to synchronize
+        
         exit_all_loops:;
         c++;
+        
+        // Optional: Add periodic progress reporting per warp
+        if (c % 10000 == 0 && lane_id == 0 && warp_id < 10) {
+            printf("Warp %d (base %d): %d iterations, %llu keys checked\n", 
+                   warp_id, warp_base, c, local_keys_checked);
+        }
     }
 }
+
+
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " (required <min> <max> <target>) (optional <blocks> <threads>)" << std::endl;
@@ -1473,7 +1516,8 @@ int main(int argc, char* argv[]) {
     
     try {
         init_gpu_constants();
-        
+		precompute_G_kernel<<<1, 1>>>();
+        cudaDeviceSynchronize();
         // Allocate device memory for 3 strings
         char *d_param1, *d_param2, *d_param3;
         
